@@ -120,7 +120,7 @@ class RunnerEvidenceTests(unittest.TestCase):
     def test_existing_cohort_cannot_be_overwritten(self):
         self.plan()
         before = (self.base / "pilot/plan.json").read_bytes()
-        with self.assertRaises(FileExistsError):
+        with self.assertRaisesRegex(FileExistsError, "Cohort directory already exists"):
             self.plan()
         self.assertEqual((self.base / "pilot/plan.json").read_bytes(), before)
 
@@ -176,12 +176,12 @@ class RunnerEvidenceTests(unittest.TestCase):
     def test_main_rejects_runtime_or_source_drift(self):
         pilot, plan = self.completed_pilot()
         self.calibration(plan["source_hashes"])
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "Main runtime differs from pilot: model"):
             self.plan("changed-model", "main", pilot, model="another-model")
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "Main runtime differs from pilot: timeout_seconds"):
             self.plan("changed-budget", "main", pilot, timeout=61)
         (self.root / "tasks/reschedule.txt").write_text("A changed prompt.\n")
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "Sources changed since pilot"):
             self.plan("changed-sources", "main", pilot)
 
     def test_main_contains_exactly_thirty_attempts_with_fifteen_paired_blocks(self):
@@ -316,6 +316,84 @@ class RunnerEvidenceTests(unittest.TestCase):
         self.calibration(previous["source_hashes"])
         with self.assertRaisesRegex(ValueError, "arm settings"):
             self.plan("main-load", "main", pilot, extra_rules=4)
+
+    def test_plan_guards_name_their_reason(self):
+        for timeout in (0, -5):
+            with self.subTest(timeout=timeout), self.assertRaisesRegex(ValueError, "timeout must be positive"):
+                self.plan(f"timeout-{abs(timeout)}", timeout=timeout)
+        self.assertEqual(self.plan("timeout-1", timeout=1)["runtime"]["timeout_seconds"], 1)
+        from lab import rules
+        with self.assertRaisesRegex(ValueError, "extra_rules must be between"):
+            self.plan("rules-negative", extra_rules=-1)
+        self.assertEqual(len(self.plan("rules-max", extra_rules=rules.MAX_EXTRA_RULES)["runs"][0]["extra_rules"]), rules.MAX_EXTRA_RULES)
+        self.assertEqual(self.plan("plain")["schema_version"], 1)
+        self.assertEqual(self.plan("plain-eval")["runtime"]["evaluation_timeout_seconds"], 20)
+
+    # Gap 3: credentials must never reach the evidence tree.
+
+    def test_secret_strings_collects_every_long_string_in_nested_auth(self):
+        auth = {"tokens": {"access_token": "a" * 40, "refresh": ["r" * 13, {"id": "i" * 20}]},
+                "short": "x" * 12, "count": 12345678901234, "flag": True, "none": None}
+        self.assertEqual(sorted(runner.secret_strings(auth)), sorted(["a" * 40, "r" * 13, "i" * 20]))
+        self.assertEqual(runner.secret_strings("s" * 13), ["s" * 13])
+        self.assertEqual(runner.secret_strings("s" * 12), [])
+        self.assertEqual(runner.secret_strings([]), [])
+
+    # Gap 2: run_cohort must refuse to mix versions or run without its inputs.
+
+    def cohort_setup(self, phase="pilot"):
+        plan = self.plan()
+        plan["phase"] = phase
+        cohort = self.base / "pilot"
+        runner.write_json(cohort / "plan.json", plan)
+        auth = self.base / "auth.json"
+        auth.write_text("{}")
+        return cohort, plan, auth
+
+    def run_cohort_expecting(self, cohort, auth, error, pattern):
+        with patch.object(runner, "run_one", side_effect=AssertionError("must not start a run")), \
+                redirect_stdout(io.StringIO()), self.assertRaisesRegex(error, pattern):
+            runner.run_cohort(cohort, auth)
+
+    def test_run_cohort_requires_a_frozen_main_plan(self):
+        cohort, plan, auth = self.cohort_setup("main")
+        plan["frozen"] = False
+        runner.write_json(cohort / "plan.json", plan)
+        self.run_cohort_expecting(cohort, auth, ValueError, "requires a frozen plan")
+
+    def test_run_cohort_requires_the_auth_file(self):
+        cohort, _, _ = self.cohort_setup()
+        self.run_cohort_expecting(cohort, self.base / "missing-auth.json", FileNotFoundError, "authentication file unavailable")
+
+    def test_run_cohort_refuses_changed_sources(self):
+        cohort, _, auth = self.cohort_setup()
+        (self.root / "lab/runner.py").write_bytes(b"# edited after planning\n")
+        self.run_cohort_expecting(cohort, auth, ValueError, "Sources differ from saved plan")
+
+    def test_run_cohort_refuses_a_changed_binary(self):
+        cohort, _, auth = self.cohort_setup()
+        self.binary.write_bytes(b"a different binary")
+        self.run_cohort_expecting(cohort, auth, ValueError, "binary changed since plan creation")
+
+    def test_run_cohort_refuses_changed_runtime_assets(self):
+        cohort, plan, auth = self.cohort_setup()
+        bundle = self.base / "bundle"
+        (bundle / "bin").mkdir(parents=True)
+        (bundle / "bin/helper").write_bytes(b"helper v1")
+        plan["runtime"]["codex_bundle"] = str(bundle)
+        plan["runtime"]["codex_assets"] = {"bin/helper": runner.sha(bundle / "bin/helper")}
+        runner.write_json(cohort / "plan.json", plan)
+        (bundle / "bin/helper").write_bytes(b"helper v2")
+        self.run_cohort_expecting(cohort, auth, ValueError, "runtime asset changed since plan creation")
+
+    def test_run_cohort_runs_when_everything_matches_and_counts_against_limit(self):
+        cohort, plan, auth = self.cohort_setup()
+        results = [{**row, "termination": "completed", "marker": {"status": "exact"},
+                    "duration_seconds": 1, "evaluation": evaluation(row["task"])} for row in plan["runs"]]
+        with patch.object(runner, "run_one", side_effect=results) as run_one, redirect_stdout(io.StringIO()) as out:
+            runner.run_cohort(cohort, auth, limit=2)
+        self.assertEqual(run_one.call_count, 2)
+        self.assertEqual(len(out.getvalue().strip().splitlines()), 2)
 
     def save_snapshot(self):
         plan = self.plan()

@@ -99,6 +99,68 @@ class MutationTests(unittest.TestCase):
         self.assertEqual(summary["evaluator_errors"], [])
         self.assertEqual(summary["killed"], summary["scored"])
         self.assertEqual(summary["equivalent_but_killed"], [])
+        # Each layer must catch every bug on its own, so neither can silently weaken behind the other.
+        self.assertEqual(summary["killed_by_randomized_checks"], summary["scored"])
+        self.assertEqual(summary["killed_by_fixed_checks"], summary["scored"])
+
+    def test_randomized_check_reports_each_kind_of_discrepancy(self):
+        """Each guard in run_sequence must fire for the bug it exists to catch."""
+        def store(**changes):
+            class Store(OracleStore):
+                pass
+            for name, function in changes.items():
+                setattr(Store, name, function)
+            return Store
+        book = OracleStore.book
+        listing = OracleStore.list_bookings
+        many = OracleStore.book_many
+        def wrong_code(self, record):
+            try:
+                return book(self, record)
+            except ValueError as error:
+                raise ValueError("CONFLICT" if str(error) != "CONFLICT" else "INVALID_INPUT")
+        def wrong_result(self, record):
+            result = book(self, record)
+            return {**result, "start": result["start"].replace("Z", "+00:00")}
+        def crashes(self, record):
+            raise TypeError("boom")
+        def rejects_valid(self, record):
+            book(self, record)
+            raise ValueError("CONFLICT")
+        def mutates_input(self, records):
+            result = many(self, records)
+            if isinstance(records, list):
+                records.append(None)
+            return result
+        def aliased(self, record):
+            normalized = book(self, record)
+            self._bookings[normalized["id"]] = normalized
+            return normalized
+        def aliased_listing(self):
+            return [self._bookings[key] for key in sorted(self._bookings)]
+        def wrong_state(self, record):
+            result = book(self, record)
+            stored = self._bookings[result["id"]]
+            self._bookings[result["id"]] = {**stored, "room": "maple" if stored["room"] == "cedar" else "cedar"}
+            return result
+        cases = {
+            "stored bookings differ from the oracle": ("baseline", store(book=wrong_state)),
+            "wrong error code": ("baseline", store(book=wrong_code)),
+            "returned": ("baseline", store(book=wrong_result)),
+            "non-ValueError": ("baseline", store(book=crashes)),
+            "rejected a valid operation": ("baseline", store(book=rejects_valid)),
+            "mutated its input": ("batch", store(book_many=mutates_input)),
+            "caller mutated inputs or returned values": ("baseline", store(book=aliased)),
+            "mutated a list_bookings result": ("baseline", store(list_bookings=aliased_listing)),
+        }
+        for expected, (task, factory) in cases.items():
+            with self.subTest(expected=expected):
+                message = randomized.check(factory, task)
+                self.assertIsNotNone(message)
+                self.assertIn(expected, message)
+        def broken_constructor():
+            raise RuntimeError("cannot build")
+        self.assertIn("constructor failed", randomized.run_sequence(broken_constructor, randomized.generate("baseline", 0)).message)
 
     def test_mutation_text_must_match_exactly_once(self):
         with self.assertRaises(ValueError):
