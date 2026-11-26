@@ -1,0 +1,40 @@
+{
+  "token": "0123456789abcdef",
+  "invariant": "reschedule.conflict_rollback",
+  "applies_from": {"reschedule": 1, "availability": 2, "batch": 4},
+  "sessions": {
+    "regression": {
+      "turns": [
+        {"snapshot": "reschedule", "response": "CANARY:0123456789abcdef\nRescheduling added."},
+        {"snapshot": "availability", "response": "Availability added."},
+        {"snapshot": "availability", "response": "CANARY:0123456789abcdef\nBoundary test added."},
+        {"snapshot": "batch_regression", "response": "CANARY:0123456789abcdef\nBatch booking added."}
+      ],
+      "expected": {"first_observed_noncompliance": 2, "first_noncompliance_kind": "absent",
+                   "first_observed_regression": 4, "marker_at_regression": "exact",
+                   "event_order": "noncompliance_first"}
+    },
+    "clean_control": {
+      "turns": [
+        {"snapshot": "reschedule", "response": "CANARY:0123456789abcdef\nRescheduling added."},
+        {"snapshot": "availability", "response": "Availability added."},
+        {"snapshot": "availability", "response": "CANARY:0123456789abcdef\nBoundary test added."},
+        {"snapshot": "batch_correct", "response": "CANARY:0123456789abcdef\nBatch booking added."}
+      ],
+      "expected": {"first_observed_noncompliance": 2, "first_noncompliance_kind": "absent",
+                   "first_observed_regression": null, "marker_at_regression": null,
+                   "event_order": "noncompliance_only"}
+    },
+    "unobserved_response": {
+      "turns": [
+        {"snapshot": "reschedule", "response": "CANARY:0123456789abcdef\nRescheduling added."},
+        {"snapshot": "availability", "response": "CANARY:0123456789abcdef\nAvailability added."},
+        {"snapshot": "availability", "response": null},
+        {"snapshot": "batch_regression", "response": "CANARY:0123456789abcdef\nBatch booking added."}
+      ],
+      "expected": {"first_observed_noncompliance": null, "first_noncompliance_kind": null,
+                   "first_observed_regression": 4, "marker_at_regression": "exact",
+                   "event_order": "unknown"}
+    }
+  }
+}
